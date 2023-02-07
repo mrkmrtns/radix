@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/mediocregopher/radix/v4/resp"
@@ -212,8 +213,9 @@ type pubSubConn struct {
 	cfg  pubSubConfig
 	conn Conn
 
-	subs, psubs map[string]bool
-	pingTicker  *clock.Ticker
+	subs, psubs         map[string]bool
+	subsLock, psubsLock sync.RWMutex
+	pingTicker          *clock.Ticker
 }
 
 func (cfg pubSubConfig) new(conn Conn) PubSubConn {
@@ -253,9 +255,12 @@ func (c *pubSubConn) Subscribe(ctx context.Context, channels ...string) error {
 		return err
 	}
 
+	c.subsLock.Lock()
 	for _, ch := range channels {
 		c.subs[ch] = true
 	}
+	c.subsLock.Unlock()
+
 	return nil
 }
 
@@ -267,9 +272,11 @@ func (c *pubSubConn) Unsubscribe(ctx context.Context, channels ...string) error 
 	if len(channels) == 0 {
 		c.subs = map[string]bool{}
 	} else {
+		c.subsLock.Lock()
 		for _, ch := range channels {
 			delete(c.subs, ch)
 		}
+		c.subsLock.Unlock()
 	}
 
 	return nil
@@ -280,9 +287,12 @@ func (c *pubSubConn) PSubscribe(ctx context.Context, patterns ...string) error {
 		return err
 	}
 
+	c.psubsLock.Lock()
 	for _, p := range patterns {
 		c.psubs[p] = true
 	}
+	c.psubsLock.Unlock()
+
 	return nil
 }
 
@@ -294,9 +304,11 @@ func (c *pubSubConn) PUnsubscribe(ctx context.Context, patterns ...string) error
 	if len(patterns) == 0 {
 		c.psubs = map[string]bool{}
 	} else {
+		c.psubsLock.Lock()
 		for _, p := range patterns {
 			delete(c.psubs, p)
 		}
+		c.psubsLock.Unlock()
 	}
 
 	return nil
@@ -362,13 +374,23 @@ func (c *pubSubConn) Next(ctx context.Context) (PubSubMessage, error) {
 		}
 
 		if msg.Pattern != "" {
-			if !c.psubs[msg.Pattern] {
+			c.psubsLock.RLock()
+			b := c.psubs[msg.Pattern]
+			c.psubsLock.RUnlock()
+
+			if !b {
 				c.testEvent("skipped-pattern")
 				continue
 			}
-		} else if !c.subs[msg.Channel] {
-			c.testEvent("skipped-channel")
-			continue
+		} else {
+			c.subsLock.RLock()
+			b := c.subs[msg.Channel]
+			c.subsLock.RUnlock()
+
+			if !b {
+				c.testEvent("skipped-channel")
+				continue
+			}
 		}
 
 		return msg, nil
@@ -398,8 +420,9 @@ type persistentPubSubConn struct {
 	cfg  PersistentPubSubConnConfig
 	dial func(context.Context) (Conn, error)
 
-	subs, psubs map[string]bool
-	conn        PubSubConn
+	subs, psubs         map[string]bool
+	subsLock, psubsLock sync.RWMutex
+	conn                PubSubConn
 }
 
 // New is like PubSubConfig.New, but instead of taking in an existing Conn to
@@ -462,21 +485,32 @@ func (p *persistentPubSubConn) refresh(ctx context.Context) error {
 	p.conn = p.cfg.PubSubConfig.New(conn)
 
 	mtos := func(m map[string]bool) []string {
-		strs := make([]string, 0, len(m))
+		strs := make([]string, len(m))
+		i := 0
 		for str := range m {
-			strs = append(strs, str)
+			strs[i] = str
+			i++
 		}
 		return strs
 	}
 
 	if len(p.subs) > 0 {
-		if err := p.conn.Subscribe(ctx, mtos(p.subs)...); err != nil {
+		p.subsLock.RLock()
+		psubs := mtos(p.subs)
+		p.subsLock.RUnlock()
+
+		if err := p.conn.Subscribe(ctx, psubs...); err != nil {
+
 			return fmt.Errorf("recreating subscriptions: %w", err)
 		}
 	}
 
 	if len(p.psubs) > 0 {
-		if err := p.conn.PSubscribe(ctx, mtos(p.psubs)...); err != nil {
+		p.psubsLock.RLock()
+		ppsubs := mtos(p.psubs)
+		p.psubsLock.RUnlock()
+
+		if err := p.conn.PSubscribe(ctx, ppsubs...); err != nil {
 			return fmt.Errorf("recreating pattern subscriptions: %w", err)
 		}
 	}
@@ -510,9 +544,11 @@ func (p *persistentPubSubConn) do(ctx context.Context, fn func() error) error {
 }
 
 func (p *persistentPubSubConn) Subscribe(ctx context.Context, channels ...string) error {
+	p.subsLock.Lock()
 	for _, ch := range channels {
 		p.subs[ch] = true
 	}
+	p.subsLock.Unlock()
 
 	return p.do(ctx, func() error { return p.conn.Subscribe(ctx, channels...) })
 }
@@ -522,18 +558,22 @@ func (p *persistentPubSubConn) Unsubscribe(ctx context.Context, channels ...stri
 	if len(channels) == 0 {
 		p.subs = map[string]bool{}
 	} else {
+		p.subsLock.Lock()
 		for _, ch := range channels {
 			delete(p.subs, ch)
 		}
+		p.subsLock.Unlock()
 	}
 
 	return p.do(ctx, func() error { return p.conn.Unsubscribe(ctx, channels...) })
 }
 
 func (p *persistentPubSubConn) PSubscribe(ctx context.Context, patterns ...string) error {
+	p.psubsLock.Lock()
 	for _, pat := range patterns {
 		p.psubs[pat] = true
 	}
+	p.psubsLock.Unlock()
 
 	return p.do(ctx, func() error { return p.conn.PSubscribe(ctx, patterns...) })
 }
@@ -543,9 +583,11 @@ func (p *persistentPubSubConn) PUnsubscribe(ctx context.Context, patterns ...str
 	if len(patterns) == 0 {
 		p.psubs = map[string]bool{}
 	} else {
+		p.psubsLock.Lock()
 		for _, pat := range patterns {
 			delete(p.psubs, pat)
 		}
+		p.psubsLock.Unlock()
 	}
 
 	return p.do(ctx, func() error { return p.conn.PUnsubscribe(ctx, patterns...) })
